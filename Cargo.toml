@@ -1,0 +1,9 @@
+[package]
+name = "check_ethernet"
+version = "0.1.0"
+authors = ["Andreas Maus <maus@ypbind.de>"]
+edition = "2018"
+
+[dependencies]
+getopts = "0.2"
+
