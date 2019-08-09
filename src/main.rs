@@ -1,6 +1,10 @@
 extern crate getopts;
+extern crate pnet;
+extern crate ipnetwork;
 
 use getopts::Options;
+
+use pnet::datalink;
 
 use std::env;
 use std::process;
@@ -11,12 +15,16 @@ const STATE_WARNING: i32 = 1;
 const STATE_CRITICAL: i32 = 2;
 const STATE_UNKNOWN: i32 = 3;
 
+const ADDR_IPV4: u32 = 0x01;
+const ADDR_IPV6: u32 = 0x02;
+
 struct Configuration {
     interface: String,
     mtu: i32,
     speed: i32,
     duplex: String,
     report_critical: bool,
+    address_type: u32,
 }
 
 struct InterfaceState {
@@ -25,6 +33,7 @@ struct InterfaceState {
     mtu: i32,
     operstate: String,
     duplex: String,
+    ips: Vec<ipnetwork::IpNetwork>,
 }
 
 struct NagiosStatus {
@@ -40,7 +49,15 @@ impl NagiosStatus {
         let mut warning = Vec::new();
         let mut ok = Vec::new();
         let mut unknown = Vec::new();
-
+        let link_local_ipv4: ipnetwork::Ipv4Network = "169.254.0.0/16".parse().unwrap();
+        let link_local_ipv6: ipnetwork::Ipv6Network = "fe80::/10".parse().unwrap();
+        let mut link_local_4 = 0;
+        let mut non_link_local_4 = 0;
+        let mut link_local_6 = 0;
+        let mut non_link_local_6 = 0;
+        let mut non_link_local = 0;
+        let mut link_local = 0;
+        
         if !ifs.present {
             critical.push("Interface is not present".to_string());
             // no need to check futher parameters
@@ -103,6 +120,49 @@ impl NagiosStatus {
             }
         }
 
+        // check assigned addresses
+        if cfg.address_type != 0 {
+            for n in &ifs.ips {
+                match n {
+                    ipnetwork::IpNetwork::V4(addr) => {
+                        if link_local_ipv4.contains(addr.ip()) {
+                            link_local_4 += 1;
+                        } else {
+                            non_link_local_4 += 1;
+                        }
+                    },
+                    ipnetwork::IpNetwork::V6(addr) => {
+                        if link_local_ipv6.contains(addr.ip()) {
+                            link_local_6 += 1;
+                        } else {
+                            non_link_local_6 += 1;
+                        }
+                    },
+                };
+                    
+            }
+
+            if cfg.address_type & ADDR_IPV4 == ADDR_IPV4 {
+                link_local += link_local_4;
+                non_link_local += non_link_local_4;
+            }
+            if cfg.address_type & ADDR_IPV6 == ADDR_IPV6 {
+                link_local += link_local_6;
+                non_link_local += non_link_local_6;
+            }
+
+            if non_link_local == 0 && link_local == 0 {
+                // no address assigned
+                critical.push("No IP address assigned".to_string());
+            } else if non_link_local == 0 && link_local > 0 {
+                // only link local addresses assigned
+                critical.push("Only link local address(es) are assigned".to_string());
+            } else {
+                // OK: non-link local address(es) and zero ore more link local addresses
+                ok.push("Non link local address(es) assigned".to_string());
+            }
+        }
+
         NagiosStatus{ critical, warning, ok, unknown }
     }
 
@@ -136,7 +196,7 @@ impl InterfaceState {
         let operstate: String = "unknown".to_string();
         let duplex: String = "unknown".to_string();
         let mut present: bool = false;
-
+        let mut ips: Vec<ipnetwork::IpNetwork> = Vec::new();
         let mut sysfs_path = "/sys/class/net/".to_owned();
         sysfs_path.push_str(cfg.interface.as_str());
 
@@ -152,19 +212,29 @@ impl InterfaceState {
         let mut speed_file = sysfs_path.clone();
         speed_file.push_str("/speed");
 
+        for interface in datalink::interfaces() {
+            if interface.name == cfg.interface {
+                ips = interface.ips;
+            }
+        }
+        // if datalink::interfaces doesn't return the interface as result it doesn't exist
+        if ips.len() == 0 {
+            return Ok(InterfaceState{ present, speed, mtu, operstate, duplex, ips });
+        }
+
         let operstate = match fs::read_to_string(operstate_file) {
             Ok(s) => { s.trim().to_string() },
-            Err(_) => { return Ok(InterfaceState{ present, speed, mtu, operstate, duplex }) },
+            Err(_) => { return Ok(InterfaceState{ present, speed, mtu, operstate, duplex, ips }) },
         };
 
         let duplex = match fs::read_to_string(duplex_file) {
             Ok(s) => { s.trim().to_string() },
-            Err(_) => { return Ok(InterfaceState{ present, speed, mtu, operstate, duplex }) },
+            Err(_) => { return Ok(InterfaceState{ present, speed, mtu, operstate, duplex, ips }) },
         };
 
         let raw_mtu = match fs::read_to_string(mtu_file) {
             Ok(s) => { s.trim().to_string() },
-            Err(_) => { return Ok(InterfaceState{ present, speed, mtu, operstate, duplex }) },
+            Err(_) => { return Ok(InterfaceState{ present, speed, mtu, operstate, duplex, ips }) },
         };
         mtu = match raw_mtu.trim().parse() {
             Ok(v) => { v },
@@ -175,7 +245,7 @@ impl InterfaceState {
 
         let raw_speed = match fs::read_to_string(speed_file) {
             Ok(s) => { s.trim().to_string() },
-            Err(_) => { return Ok(InterfaceState{ present, speed, mtu, operstate, duplex }) },
+            Err(_) => { return Ok(InterfaceState{ present, speed, mtu, operstate, duplex, ips }) },
         };
         speed = match raw_speed.parse() {
             Ok(v) => { v },
@@ -185,41 +255,47 @@ impl InterfaceState {
         // if we are at this point we are pretty sure the interface exists
         present = true;
 
-        Ok(InterfaceState{ present, speed, mtu, operstate, duplex })
+        Ok(InterfaceState{ present, speed, mtu, operstate, duplex, ips })
     }
 }
 
 
 fn usage() {
-    println!("check_ethernet version 0.1.0\n\
+    println!("check_ethernet version 0.2.0\n\
 Copyright (C) by Andreas Maus <maus@ypbind.de>\n\
 This program comes with ABSOLUTELY NO WARRANTY.\n\
 \n\
 check_ethernet is distributed under the Terms of the GNU General\n\
 Public License Version 3. (http://www.gnu.org/copyleft/gpl.html)\n\
 \n\
-Usage: check_ethernet -i <if>|--interface=<if> [-m <mtu>|--mtu=<mtu>] [-s <state>|--state=<state>]   [-C|--critical] [-h|--help]\n\
+Usage: check_ethernet -i <if>|--interface=<if> [-m <mtu>|--mtu=<mtu>] [-s <state>|--state=<state>]   [-C|--critical] [-h|--help] [-a=[ip|ipv4|ipv6]|--address-assigned=[ip|ipv4|ipv6]\n\
 \n\
-    -i <if>             Ethernet interface to check.\n\
+    -a =[ip|ipv4|ipv6]                  Check if non-link local address has been assigned to the interface\n\
+    --address-assigned=[ip|ipv4|ipv6]   ip   - IPv4 (169.254.0.0/16) and IPv6 (fe80::/10)
+                                        ipv4 - IPv4 (169.254.0.0/16) only
+                                        ipv6 - IPv6 (fe80::/10) only
+
+    -i <if>                             Ethernet interface to check.\n\
     --interface=<if>\n\
 \n\
-    -m <mtu>            Expceted MTU value for interface.\n\
+    -m <mtu>                            Expceted MTU value for interface.\n\
     --mtu=<mtu>\n\
 \n\
-    -s <state>          Expceted state. <state> is consists of <speed>[:<mode>] where <speed> is the\n\
-    --state=<state>     expected negotiated link speed in MBit/s and <mode> is the negotiated link mode.\n\
-                        <mode> can be one of \"half\" or \"full\". Default: 1000:full\n\
+    -s <state>                          Expceted state. <state> is consists of <speed>[:<mode>] where <speed> is the\n\
+    --state=<state>                     expected negotiated link speed in MBit/s and <mode> is the negotiated link mode.\n\
+                                        <mode> can be one of \"half\" or \"full\". Default: 1000:full\n\
 \n\
-    -C                  Report CRITICAL condition if state is below requested speed or duplex (or both) or MTU size\n\
-    --critical          does not match. Default: Report WARNING state\n\
+    -C                                  Report CRITICAL condition if state is below requested speed or duplex (or both) or MTU size\n\
+    --critical                          does not match. Default: Report WARNING state\n\
 \n\
-    -h                  This text\n\
+    -h                                  This text\n\
     --help\n\
 \n");
 }
 
 impl Configuration {
     fn new(argv: &[String], opts: &Options) -> Result<Configuration, &'static str> {
+        let address_type: u32;
         let opt_match = match opts.parse(&argv[1..]) {
             Ok(o) => { o },
             Err(_) => {
@@ -281,11 +357,32 @@ impl Configuration {
             report_critical = true;
         };
 
+
+        let raw_address_type = match opt_match.opt_str("a") {
+            Some(a) => { a },
+            None => { "".to_string() },
+        };
+
+        if raw_address_type != "" && raw_address_type != "ip" && raw_address_type != "ipv4" && raw_address_type != "ipv6" {
+        }
+
+        if raw_address_type == "ip" {
+            address_type = ADDR_IPV4 | ADDR_IPV6;
+        } else if raw_address_type == "ipv4" {
+            address_type = ADDR_IPV4;
+        } else if raw_address_type == "ipv6" {
+            address_type = ADDR_IPV6;
+        } else if raw_address_type == "" {
+            address_type = 0;
+        } else {
+            return Err("Invalid parameter for address assignment check");
+        }
+
         if interface == "" {
             return Err("Interface to check is mandatory");
         };
 
-        Ok(Configuration{ interface, mtu, speed, duplex, report_critical })
+        Ok(Configuration{ interface, mtu, speed, duplex, report_critical, address_type })
     }
 }
 
@@ -298,6 +395,7 @@ fn main() {
     options.optopt("m", "mtu", "Expceted MTU value for interface.", "");
     options.optopt("s", "state", "Expceted state.", "");
     options.optflag("C", "critical", "Report CRITICAL condition if state is below requested speed or duplex (or both) or MTU size does not match.");
+    options.optopt("a", "address-assigned", "Check if non-link local address has been assigned to the interface.", "");
 
     let cfg = Configuration::new(&argv, &options).unwrap_or_else(|err| {
         println!("Error: {}", err);
