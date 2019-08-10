@@ -394,12 +394,12 @@ fn main() {
     options.optopt("a", "address-assigned", "Check if non-link local address has been assigned to the interface.", "");
 
     let cfg = Configuration::new(&argv, &options).unwrap_or_else(|err| {
-        println!("Error: {}", err);
+        eprintln!("Error: {}", err);
         process::exit(STATE_UNKNOWN);
     });
 
     let ifstate = InterfaceState::new(&cfg).unwrap_or_else(|err| {
-        println!("{}", err);
+        eprintln!("{}", err);
         process::exit(STATE_UNKNOWN);
     });
 
