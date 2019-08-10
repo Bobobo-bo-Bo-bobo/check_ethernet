@@ -217,10 +217,6 @@ impl InterfaceState {
                 ips = interface.ips;
             }
         }
-        // if datalink::interfaces doesn't return the interface as result it doesn't exist
-        if ips.len() == 0 {
-            return Ok(InterfaceState{ present, speed, mtu, operstate, duplex, ips });
-        }
 
         let operstate = match fs::read_to_string(operstate_file) {
             Ok(s) => { s.trim().to_string() },
@@ -261,7 +257,7 @@ impl InterfaceState {
 
 
 fn usage() {
-    println!("check_ethernet version 0.2.0\n\
+    println!("check_ethernet version 0.2.1\n\
 Copyright (C) by Andreas Maus <maus@ypbind.de>\n\
 This program comes with ABSOLUTELY NO WARRANTY.\n\
 \n\
