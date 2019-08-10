@@ -1,6 +1,6 @@
 [package]
 name = "check_ethernet"
-version = "0.2.0"
+version = "0.2.1"
 authors = ["Andreas Maus <maus@ypbind.de>"]
 edition = "2018"
 
